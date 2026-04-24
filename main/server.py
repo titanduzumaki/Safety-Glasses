@@ -5,99 +5,219 @@ import cv2
 import numpy as np
 import threading
 import time
+import os
+import uuid
+from deepface import DeepFace
 
 app = Flask(__name__)
 
-# Shared state
-latest_frame = None
+# ===== GLOBAL STATE =====
+processing_frame = None
+processed_frame = None
 lock = threading.Lock()
-last_update_ts = 0.0
 
+# ===== CONFIG =====
+FACE_DIR = "faces"
+os.makedirs(FACE_DIR, exist_ok=True)
+
+MODEL_NAME = "Facenet512"
+THRESHOLD = 7.5
+MAX_PEOPLE = 10
+COOLDOWN = 2
+FRAME_SKIP = 5
+
+# ===== DATABASE =====
+face_db = {}   # {id: [embeddings]}
+last_seen = {}
+frame_counter = 0
+
+# ===== FACE DETECTOR =====
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+
+# ===== GET EMBEDDING =====
+def get_embedding(face_img):
+    try:
+        result = DeepFace.represent(
+            face_img,
+            model_name=MODEL_NAME,
+            enforce_detection=False
+        )
+        return np.array(result[0]["embedding"])
+    except:
+        return None
+
+# ===== MATCH =====
+def match_face(embedding):
+    best_id = None
+    best_dist = 999
+
+    for fid, embeddings in face_db.items():
+        avg = np.mean(embeddings, axis=0)
+        dist = np.linalg.norm(embedding - avg)
+
+        if dist < best_dist:
+            best_dist = dist
+            best_id = fid
+
+    if best_dist < THRESHOLD:
+        return best_id
+    return None
+
+# ===== REGISTER =====
+def register_face(face_img):
+    global face_db, last_seen
+
+    if face_img.shape[0] < 80 or face_img.shape[1] < 80:
+        return None
+
+    embedding = get_embedding(face_img)
+    if embedding is None:
+        return None
+
+    face_id = match_face(embedding)
+
+    if face_id:
+        if face_id in last_seen and time.time() - last_seen[face_id] < COOLDOWN:
+            return face_id
+
+        face_db[face_id].append(embedding)
+        last_seen[face_id] = time.time()
+        return face_id
+
+    # NEW PERSON
+    if len(face_db) >= MAX_PEOPLE:
+        return None
+
+    face_id = str(uuid.uuid4())[:8]
+    face_db[face_id] = [embedding]
+    last_seen[face_id] = time.time()
+
+    cv2.imwrite(os.path.join(FACE_DIR, f"{face_id}.jpg"), face_img)
+
+    print(f"[NEW FACE] {face_id}")
+
+    return face_id
+
+# ===== PROCESS FRAME =====
 def process_frame(frame):
-    """
-    Put your AI here.
-    Example: face detection + box.
-    """
+    global frame_counter
+    frame_counter += 1
+
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    face_cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        1.1,
+        4,
+        minSize=(30,30)
     )
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
     for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-    return frame
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    global latest_frame, last_update_ts
-    data = request.data
-    if not data:
-        return "No data", 400
-
-    npimg = np.frombuffer(data, dtype=np.uint8)
-    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    if frame is None:
-        return "Decode failed", 400
-
-    frame = process_frame(frame)
-
-    with lock:
-        latest_frame = frame
-        last_update_ts = time.time()
-
-    return "OK", 200
-
-def mjpeg_generator(fps):
-    """
-    Streams the latest frame as MJPEG.
-    """
-    delay = 1.0 / max(fps, 0.1)
-    while True:
-        with lock:
-            frame = None if latest_frame is None else latest_frame.copy()
-
-        if frame is None:
-            # Send a blank frame or wait
-            blank = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(blank, "Waiting for frames...", (30, 240),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-            ok, buf = cv2.imencode(".jpg", blank)
-        else:
-            ok, buf = cv2.imencode(".jpg", frame)
-
-        if not ok:
+        if w < 80 or h < 80:
             continue
 
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
+        face_crop = frame[y:y+h, x:x+w]
 
-        time.sleep(delay)
+        if frame_counter % FRAME_SKIP == 0:
+            face_id = register_face(face_crop)
+        else:
+            face_id = None
 
+        label = f"ID:{face_id}" if face_id else "..."
+
+        cv2.rectangle(frame, (x,y), (x+w,y+h), (0,255,0), 2)
+        cv2.putText(frame, label, (x,y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+    cv2.putText(frame, f"People: {len(face_db)}",
+                (20,40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
+    return frame
+
+# ===== BACKGROUND THREAD =====
+def processing_worker():
+    global processing_frame, processed_frame
+
+    while True:
+        if processing_frame is None:
+            time.sleep(0.01)
+            continue
+
+        with lock:
+            frame = processing_frame.copy()
+
+        frame = process_frame(frame)
+
+        with lock:
+            processed_frame = frame
+
+# ===== RECEIVE =====
+@app.route("/upload", methods=["POST"])
+def upload():
+    global processing_frame
+
+    data = request.data
+    npimg = np.frombuffer(data, np.uint8)
+    frame = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        return "Error", 400
+
+    with lock:
+        processing_frame = frame.copy()
+
+    return "OK"
+
+# ===== STREAM =====
+def generate():
+    while True:
+        with lock:
+            frame = processed_frame
+
+        if frame is None:
+            blank = np.zeros((480,640,3), dtype=np.uint8)
+            cv2.putText(blank, "Waiting...",
+                        (30,240),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (255,255,255), 2)
+            ret, buffer = cv2.imencode(".jpg", blank)
+        else:
+            ret, buffer = cv2.imencode(".jpg", frame)
+
+        if not ret:
+            continue
+
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' +
+               buffer.tobytes() + b'\r\n')
+
+# ===== ROUTES =====
 @app.route("/")
 def index():
     return """
-    <html>
-      <head><title>Live Stream</title></head>
-      <body style="background:black;color:white;text-align:center;">
-        <h2>Live Feed</h2>
-        <img src="/video" width="720"/>
-      </body>
-    </html>
+    <h2>Threaded Face System</h2>
+    <img src="/video" width="720">
     """
 
 @app.route("/video")
 def video():
-    return Response(mjpeg_generator(app.config["STREAM_FPS"]),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(generate(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# ===== MAIN =====
 def main():
-    ap = argparse.ArgumentParser(description="Flask video server")
-    ap.add_argument("--host", default="0.0.0.0", help="Bind host")
-    ap.add_argument("--port", type=int, default=5000)
-    ap.add_argument("--stream-fps", type=float, default=15.0)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=5000)
+    args = parser.parse_args()
 
-    app.config["STREAM_FPS"] = args.stream_fps
+    # START BACKGROUND THREAD
+    threading.Thread(target=processing_worker, daemon=True).start()
+
     app.run(host=args.host, port=args.port, threaded=True)
 
 if __name__ == "__main__":
