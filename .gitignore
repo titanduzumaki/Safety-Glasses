@@ -1,2 +1,5 @@
 gaze_env/
 yolo_env/
+.venv/
+.env
+images/
